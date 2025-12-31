@@ -18,15 +18,123 @@ class TVGuideScraper
   
   def scrape
     html = fetch_page
-    parse_programs(html)
+    programs = parse_programs(html)
+    return programs if programs && programs.any?
+
+    # If HTML parsing didn't find anything, try discovering API endpoints and fetching JSON schedules
+    puts "⚡ No programs found in page HTML — trying site APIs..."
+    api_candidates = find_api_urls(html)
+
+    # Add some sensible defaults that often exist on the site
+    iso_date = @date.respond_to?(:iso8601) ? @date.iso8601 : @date.to_s
+    api_candidates << "https://www.dr.dk/api/schedules?date=#{iso_date}"
+    api_candidates << "https://www.dr.dk/api/schedules/#{iso_date}"
+    api_candidates << "#{BASE_URL}/api/schedules?date=#{iso_date}"
+
+    # Known page API used by the site (inspect_page.rb uses a full variant below)
+    api_candidates << "https://prod95-cdn.dr-massive.com/api/page?device=web_browser&ff=idp%2Cldp%2Crpt&include=sitemap%2Cnavigation%2Cgeneral%2Ci18n%2Cplayback%2Clinear%2CfeatureFlags&lang=da&segments=drtv%2Coptedin&sub=Anonymous2&path=%2Ftv-guide&text_entry_format=html"
+    api_candidates.uniq!
+    # Filter obvious non-API/noise endpoints (images/analytics etc.)
+    api_candidates.reject! { |u| u =~ /ResizeImage|dataservice|shain|massiveanalytics|static\.dr-massive|&#x27;/i }
+    puts "🔍 API candidates found: #{api_candidates.size}"
+
+    api_candidates.each do |url|
+      # puts "→ trying: #{url}"
+      body = fetch_json(url) rescue nil
+      next unless body
+
+      # Minimal inspection of JSON responses
+      begin
+        if body.is_a?(Hash) && body['entries'].is_a?(Array)
+          puts "  → page API entries: #{body['entries'].length}"
+
+          # collect channel tiles
+          channels = body['entries'].flat_map { |e| (e.dig('list','items') || []) }
+
+          # Try schedules by channel ids (batch GET)
+          channel_ids = channels.map { |c| c['id'] }.compact.map(&:to_s).uniq
+          if channel_ids.any?
+            channels_url = "https://prod95-cdn.dr-massive.com/api/schedules?channels=#{CGI.escape(channel_ids.join(','))}&date=#{CGI.escape(iso_date)}&device=web_browser&duration=24&hour=0&ff=idp%2Cldp%2Crpt&segments=drtv%2Coptedin&sub=Anonymous2&lang=da"
+            puts "  → trying schedules for #{channel_ids.size} channel ids"
+            sbody = fetch_json(channels_url) rescue nil
+            if sbody
+              programs = parse_programs_from_json(sbody)
+              if programs && programs.any?
+                puts "✅ Found #{programs.size} programs from channel schedules GET"
+                return programs
+              end
+            end
+          end
+
+          # Try candidate per-service URLs
+          schedule_candidates = build_schedule_candidates(channels, iso_date)
+          schedule_candidates.each do |surl|
+            sbody = fetch_json(surl) rescue nil
+            next unless sbody
+            programs = parse_programs_from_json(sbody)
+            if programs && programs.any?
+              puts "✅ Found #{programs.size} programs from schedule API"
+              return programs
+            end
+          end
+
+          # Fallback: POST batch query
+          services = channels.map { |c| c['customId'] || c['channelShortCode'] || c['channel'] }.compact.uniq
+          if services.any?
+            post_url = 'https://prod95-cdn.dr-massive.com/api/schedules'
+            payload = { 'channels' => services, 'hour' => 0, 'duration' => 24, 'date' => iso_date }
+            begin
+              resp = HTTParty.post(post_url, headers: { 'Content-Type' => 'application/json', 'Accept' => 'application/json', 'User-Agent' => 'Mozilla/5.0 (compatible; TVGuideScraper/1.0)' }, body: payload.to_json, timeout: 15)
+              if resp && resp.success?
+                sbody = JSON.parse(resp.body) rescue nil
+                programs = parse_programs_from_json(sbody)
+                if programs && programs.any?
+                  puts "✅ Found #{programs.size} programs from POST schedule query"
+                  return programs
+                end
+              else
+                puts "  → POST schedule non-success: HTTP #{resp&.code}"
+              end
+            rescue StandardError => e
+              puts "  → POST schedule error: #{e.message}"
+            end
+          end
+        end
+      rescue StandardError => e
+        puts "  → inspect error: #{e.message}"
+      end
+
+      programs_from_json = parse_programs_from_json(body)
+      if programs_from_json && programs_from_json.any?
+        puts "✅ Found #{programs_from_json.size} programs from API: #{url}"
+        return programs_from_json
+      end
+    end
+
+    programs || []
   end
   
   private  # These are helper methods (robot's internal tools)
   
   def fetch_page
-    resp = HTTParty.get(BASE_URL)
+    resp = HTTParty.get(BASE_URL, headers: { 'User-Agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36' }, timeout: 10)
     resp.success? ? resp.body : nil
-  rescue StandardError
+  rescue StandardError => e
+    puts "  → fetch_page error: #{e.message}"
+    nil
+  end
+
+  def fetch_json(url)
+    return nil unless url
+    resp = HTTParty.get(url, headers: { 'Accept' => 'application/json', 'User-Agent' => 'Mozilla/5.0 (compatible; TVGuideScraper/1.0)' }, timeout: 10)
+    unless resp && resp.success?
+      puts "  → fetch_json non-success for #{url}: HTTP #{resp&.code}"
+      return nil
+    end
+
+    JSON.parse(resp.body)
+  rescue StandardError => e
+    puts "  → fetch_json error for #{url}: #{e.message}"
     nil
   end
   
@@ -54,7 +162,10 @@ class TVGuideScraper
 
 
   # Find potential API endpoints by scanning script bundles and page HTML
-  
+  def find_api_urls(html)
+    return [] unless html
+    urls = []
+    doc = Nokogiri::HTML(html)
 
     # Script srcs
     doc.css('script[src]').each do |s|
@@ -92,8 +203,20 @@ class TVGuideScraper
   def parse_programs_from_json(json)
     arr = nil
 
+    # Handle page API entries shape (prod95-cdn page API)
+    if json.is_a?(Hash) && json['entries'].is_a?(Array)
+      list_items = json['entries'].flat_map { |e| e.is_a?(Hash) ? (e.dig('list', 'items') || []) : [] }
+      arr = list_items.map do |it|
+        {
+          'channel' => it['channelShortCode'] || it['channel'] || it['channelName'] || it['service'],
+          'title' => it['title'] || it['name'] || it['programTitle'] || 'No title',
+          'start_time' => it['startTime'] || it['broadcastStart'] || it['broadcastStartDate'],
+          'end_time' => it['endTime'] || it['broadcastEnd'] || it['broadcastEndDate']
+        }
+      end
+
     # Handle dr-massive "schedules" shape
-    if json.is_a?(Array) && json.any? { |e| e.is_a?(Hash) && e.key?('schedules') }
+    elsif json.is_a?(Array) && json.any? { |e| e.is_a?(Hash) && e.key?('schedules') }
       schedules = json.flat_map { |ch| ch['schedules'] || [] }
       arr = schedules.map do |s|
         {
@@ -123,14 +246,12 @@ class TVGuideScraper
 
       # Skip items without both start and end times
       if start_time.nil? || end_time.nil?
-        puts "⚠️ Skipping JSON item without start or end time: #{title.inspect}"
         next
       end
 
       begin
         results << Program.from_h(channel: channel || 'Unknown', start_time: start_time, title: title, end_time: end_time)
       rescue ArgumentError => e
-        puts "⚠️ Skipping program from JSON due to invalid times: #{e.message} (#{title.inspect})"
         next
       end
     end
@@ -167,5 +288,4 @@ class TVGuideScraper
     parts = text.to_s.split(/[-–—]/).map(&:strip)
     [parts[0], parts[1]]
   end
-  
 end

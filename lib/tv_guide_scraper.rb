@@ -25,11 +25,8 @@ class TVGuideScraper
     puts "⚡ No programs found in page HTML — trying site APIs..."
     api_candidates = find_api_urls(html)
 
-    # Add some sensible defaults that often exist on the site
+    # Keep date handy for later queries
     iso_date = @date.respond_to?(:iso8601) ? @date.iso8601 : @date.to_s
-    api_candidates << "https://www.dr.dk/api/schedules?date=#{iso_date}"
-    api_candidates << "https://www.dr.dk/api/schedules/#{iso_date}"
-    api_candidates << "#{BASE_URL}/api/schedules?date=#{iso_date}"
 
     # Known page API used by the site (inspect_page.rb uses a full variant below)
     api_candidates << "https://prod95-cdn.dr-massive.com/api/page?device=web_browser&ff=idp%2Cldp%2Crpt&include=sitemap%2Cnavigation%2Cgeneral%2Ci18n%2Cplayback%2Clinear%2CfeatureFlags&lang=da&segments=drtv%2Coptedin&sub=Anonymous2&path=%2Ftv-guide&text_entry_format=html"
@@ -201,12 +198,9 @@ class TVGuideScraper
 
   # Convert site JSON to Program objects, trying a few common shapes
   def parse_programs_from_json(json)
-    arr = nil
-
-    # Handle page API entries shape (prod95-cdn page API)
-    if json.is_a?(Hash) && json['entries'].is_a?(Array)
-      list_items = json['entries'].flat_map { |e| e.is_a?(Hash) ? (e.dig('list', 'items') || []) : [] }
-      arr = list_items.map do |it|
+    items = case
+    when json.is_a?(Hash) && json['entries'].is_a?(Array)
+      json['entries'].flat_map { |e| e.dig('list','items') || [] }.map do |it|
         {
           'channel' => it['channelShortCode'] || it['channel'] || it['channelName'] || it['service'],
           'title' => it['title'] || it['name'] || it['programTitle'] || 'No title',
@@ -215,43 +209,40 @@ class TVGuideScraper
         }
       end
 
-    # Handle dr-massive "schedules" shape
-    elsif json.is_a?(Array) && json.any? { |e| e.is_a?(Hash) && e.key?('schedules') }
-      schedules = json.flat_map { |ch| ch['schedules'] || [] }
-      arr = schedules.map do |s|
+    when json.is_a?(Array) && json.any? { |e| e.is_a?(Hash) && e.key?('schedules') }
+      json.flat_map { |ch| ch['schedules'] || [] }.map do |s|
         {
           'channel' => s['broadcastChannel'] || s['channelId'],
-          'title' => s.dig('item', 'title') || s['title'] || 'No title',
+          'title' => s.dig('item','title') || s['title'] || 'No title',
           'start_time' => s['startDate'] || s['startTimeInDefaultTimeZone'],
           'end_time' => s['endDate'] || s['endTimeInDefaultTimeZone']
         }
       end
-    elsif json.is_a?(Hash)
-      arr = json['programs'] || json['items'] || json['results'] || json['data'] || json.values.find { |v| v.is_a?(Array) && v.any? { |i| i.is_a?(Hash) && (i['title'] || i['name']) } }
-    elsif json.is_a?(Array)
-      arr = json
+
+    when json.is_a?(Hash)
+      json['programs'] || json['items'] || json['results'] || json['data'] || json.values.find { |v| v.is_a?(Array) && v.any? { |i| i.is_a?(Hash) && (i['title'] || i['name']) } } || []
+    when json.is_a?(Array)
+      json
+    else
+      []
     end
 
-    return nil unless arr && arr.is_a?(Array)
+    return nil if items.nil? || !items.is_a?(Array) || items.empty?
 
-    arr.each_with_object([]) do |item, results|
+    items.each_with_object([]) do |item, results|
       channel = item['channel'] || item['channelName'] || item['station'] || item['stationName'] || item['service']
-      title = item['title'] || item['name'] || item['programTitle'] || item['title'] || 'No title'
+      title = item['title'] || item['name'] || item['programTitle'] || 'No title'
       start_time = item['start_time'] || item['startTime'] || item['start'] || item['startTimeLocal'] || item['broadcastStart']
       end_time = item['end_time'] || item['endTime'] || item['end'] || item['endTimeInDefaultTimeZone'] || item['broadcastEnd']
 
-      # Preserve ISO datetime strings (contain 'T'), otherwise normalize to HH:MM where possible
       start_time = (start_time.is_a?(String) && start_time.include?('T')) ? start_time : normalize_time(start_time)
-      end_time   = (end_time.is_a?(String) && end_time.include?('T')) ? end_time : normalize_time(end_time)
+      end_time = (end_time.is_a?(String) && end_time.include?('T')) ? end_time : normalize_time(end_time)
 
-      # Skip items without both start and end times
-      if start_time.nil? || end_time.nil?
-        next
-      end
+      next unless start_time && end_time
 
       begin
         results << Program.from_h(channel: channel || 'Unknown', start_time: start_time, title: title, end_time: end_time)
-      rescue ArgumentError => e
+      rescue ArgumentError
         next
       end
     end
@@ -265,18 +256,10 @@ class TVGuideScraper
     return nil if value.nil?
 
     if value.is_a?(Numeric)
-      # ms or s
-      if value > 1_000_000_000_000
-        Time.at(value / 1000).strftime('%H:%M') rescue value.to_s
-      else
-        Time.at(value).strftime('%H:%M') rescue value.to_s
-      end
+      t = value > 1_000_000_000_000 ? value / 1000 : value
+      Time.at(t).strftime('%H:%M') rescue value.to_s
     elsif value.is_a?(String)
-      begin
-        Time.parse(value).strftime('%H:%M')
-      rescue
-        value
-      end
+      Time.parse(value).strftime('%H:%M') rescue value
     else
       value.to_s
     end
@@ -284,8 +267,8 @@ class TVGuideScraper
 
   # Parse a "HH:MM - HH:MM" style time range into [start, end]
   def parse_time_range(text)
-    return [nil, nil] if text.nil? || text.to_s.strip.empty?
-    parts = text.to_s.split(/[-–—]/).map(&:strip)
+    return [nil, nil] if text.to_s.strip.empty?
+    parts = text.to_s.split(/[-–—]/, 2).map(&:strip)
     [parts[0], parts[1]]
   end
 end

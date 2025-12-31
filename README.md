@@ -11,7 +11,7 @@ Install:
 
 ```bash
 git clone <repo-url>
-cd tv_program_scraper
+cd <file>
 bundle install
 ```
 

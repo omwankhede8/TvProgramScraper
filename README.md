@@ -102,7 +102,4 @@ bundle exec rspec
 
 ---
 
-## License
-
-See the `LICENSE` file if present.
 

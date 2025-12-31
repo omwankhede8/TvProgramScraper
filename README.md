@@ -80,7 +80,7 @@ Saved output is an array of program objects in `tv_programs.json`, for example:
 }
 ```
 
-Console output is a human-readable table showing Channel, Start, End and Title.
+Console output is a table showing Channel, Start, End and Title.
 
 ---
 
@@ -94,12 +94,5 @@ bundle exec rspec
 
 ---
 
-## Development notes
-
-- Consider adding tests that record HTTP responses (VCR/WebMock) to stabilize parsing tests
-- Add configurable logging and a `--verbose` flag for troubleshooting
-- Respect site terms, rate limits, and robots policies when scraping
-
----
 
 
